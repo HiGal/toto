@@ -47,7 +47,7 @@ class StdMeanScaler(Scaler):
         prefix_length: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert data.shape == weights.shape, "data and weights must have same shape"
-        with torch.no_grad():
+        with torch.inference_mode():
             if prefix_length is not None:
                 # Create a prefix mask that is 1 for positions within prefix, 0 elsewhere
                 prefix_mask = torch.zeros_like(weights)
@@ -148,7 +148,7 @@ def compute_causal_statistics(
     # Assert that dim is -1 (last dimension)
     assert dim == -1, "compute_causal_statistics only supports dim=-1 (last dimension)"
 
-    with torch.no_grad():
+    with torch.inference_mode():
         # Apply padding mask to weights
         weights = weights * padding_mask
 
@@ -415,7 +415,7 @@ class CausalPatchStdMeanScaler(Scaler):
         assert data.shape == weights.shape, "data and weights must have same shape"
         assert len(data.shape) == 3, "Input data must have shape [batch, variates, time_steps]"
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Get the number of time steps (last dimension)
             time_steps = data.shape[-1]
 
