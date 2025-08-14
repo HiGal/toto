@@ -20,6 +20,7 @@ from ..data.util.dataset import (
     replace_extreme_values,
 )
 from ..model.backbone import TotoBackbone
+from ..model.quantization import quantize_for_inference
 
 
 @dataclass(frozen=True)
@@ -82,9 +83,23 @@ class TotoForecaster:
 
     model: TotoBackbone
 
-    def __init__(self, model: TotoBackbone):
+    def __init__(
+        self,
+        model: TotoBackbone,
+        *,
+        compile: bool = False,
+        num_threads: int | None = None,
+        quantize: bool = False,
+    ):
+        if quantize:
+            model = quantize_for_inference(model)
+        if compile and hasattr(torch, "compile"):
+            model = torch.compile(model)  # type: ignore[attr-defined]
         self.model = model
-
+        if num_threads is not None:
+            torch.set_num_threads(num_threads)
+    
+    @torch.inference_mode()
     def forecast(
         self,
         inputs: MaskedTimeseries,
@@ -181,7 +196,7 @@ class TotoForecaster:
 
         return Forecast(mean=mean, samples=samples)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_mean(
         self,
         inputs: Float[torch.Tensor, "batch variate time_steps"],
@@ -202,60 +217,71 @@ class TotoForecaster:
         if id_mask is None:
             id_mask = torch.zeros_like(inputs, dtype=torch.int, device=inputs.device)
 
-        ## round up the prediction length to the nearest multiple of the patch size
         patch_size = self.model.patch_embed.stride
         rounded_steps = int(np.ceil(prediction_length / patch_size) * patch_size)
         start_index = inputs.shape[-1]
         end_index = start_index + prediction_length
+        final_len = start_index + rounded_steps
 
-        # TODO: maybe pass in future masks, rather than making assumptions here?
-        dummy_padding = torch.ones(
-            (input_padding_mask.shape[0], input_padding_mask.shape[1], patch_size),
+        # Preallocate buffers for future steps
+        input_buffer = torch.empty(
+            (inputs.shape[0], inputs.shape[1], final_len),
             device=inputs.device,
-            dtype=torch.bool,
+            dtype=inputs.dtype,
         )
-        dummy_id_mask = repeat(
+        input_buffer[:, :, :start_index] = inputs
+
+        id_buffer = torch.empty_like(input_buffer, dtype=id_mask.dtype)
+        id_buffer[:, :, :start_index] = id_mask
+        id_buffer[:, :, start_index:] = repeat(
             id_mask[:, :, -1:],
-            "batch variates 1 -> batch variates patch_size",
-            patch_size=patch_size,
+            "batch variates 1 -> batch variates time",
+            time=rounded_steps,
         )
+
+        padding_buffer = torch.ones(
+            (inputs.shape[0], inputs.shape[1], final_len),
+            dtype=torch.bool,
+            device=inputs.device,
+        )
+        padding_buffer[:, :, :start_index] = input_padding_mask
+
+        # Vectorized timestamp construction
+        timestamp_buffer = torch.empty_like(input_buffer, dtype=timestamp_seconds.dtype)
+        timestamp_buffer[:, :, :start_index] = timestamp_seconds
+        offsets = torch.arange(1, rounded_steps + 1, device=inputs.device, dtype=timestamp_seconds.dtype)
+        future_ts = timestamp_seconds[:, :, -1:] + time_interval_seconds.unsqueeze(-1) * offsets
+        timestamp_buffer[:, :, start_index:] = future_ts
+
         if use_kv_cache:
             kv_cache = self.model.allocate_kv_cache(
                 batch_size=inputs.shape[0],
                 num_variates=inputs.shape[1],
-                max_time_steps=inputs.shape[2] + rounded_steps,
+                max_time_steps=final_len,
                 device=inputs.device,
                 dtype=inputs.dtype,
             )
         else:
             kv_cache = None
 
-        scaling_prefix_length = inputs.shape[-1]
+        scaling_prefix_length = start_index
 
-        for _ in range(rounded_steps // patch_size):
+        for step in range(rounded_steps // patch_size):
+            cur_end = start_index + step * patch_size
             base_distr, loc, scale = self.model(
-                inputs=inputs,
-                input_padding_mask=input_padding_mask,
-                id_mask=id_mask,
+                inputs=input_buffer[:, :, :cur_end],
+                input_padding_mask=padding_buffer[:, :, :cur_end],
+                id_mask=id_buffer[:, :, :cur_end],
                 kv_cache=kv_cache,
                 scaling_prefix_length=scaling_prefix_length,
             )
             distr = self.create_affine_transformed(base_distr, loc, scale)
-
-            # We remove extreme values that can occur early in training
-            # and cause validation metrics to be NaN
             samples = replace_extreme_values(distr.mean[:, :, -patch_size:])
+            input_buffer[:, :, cur_end : cur_end + patch_size] = samples
 
-            inputs = torch.cat([inputs, samples], dim=-1)
-            id_mask = torch.cat([id_mask, dummy_id_mask], dim=-1)
-            input_padding_mask = torch.cat([input_padding_mask, dummy_padding], dim=-1)
-            for _ in range(patch_size):
-                next_timestamp: Int[torch.Tensor, "batch variate"] = timestamp_seconds[:, :, -1] + time_interval_seconds
-                timestamp_seconds = torch.cat([timestamp_seconds, next_timestamp.unsqueeze(-1)], dim=-1)
+        return input_buffer.detach()[:, :, start_index:end_index]
 
-        return inputs.detach()[:, :, start_index:end_index]
-
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_samples(
         self,
         inputs: Float[torch.Tensor, "batch variate time_steps"],
@@ -283,100 +309,103 @@ class TotoForecaster:
         assert num_samples % sampling_batch_size == 0, "num_samples must be divisible by sampling_batch_size"
         num_batches = num_samples // sampling_batch_size
 
-        # round up the prediction length to the nearest multiple of the patch size
         patch_size = self.model.patch_embed.patch_size
         rounded_steps = int(np.ceil(prediction_length / patch_size) * patch_size)
         start_index = inputs.shape[-1]
         end_index = start_index + prediction_length
+        final_len = start_index + rounded_steps
 
-        dummy_padding = torch.ones(
-            (
-                input_padding_mask.shape[0] * sampling_batch_size,
-                input_padding_mask.shape[1],
-                patch_size,
-            ),
-            dtype=torch.bool,
+        # Prepare templates for a sampling batch
+        template_inputs = torch.empty(
+            (inputs.shape[0] * sampling_batch_size, inputs.shape[1], final_len),
             device=inputs.device,
+            dtype=inputs.dtype,
         )
-        dummy_id_mask = repeat(
-            id_mask[:, :, -1:],
-            "batch variates 1 -> (sampling_batch_size batch) variates patch_size",
-            sampling_batch_size=sampling_batch_size,
-            patch_size=patch_size,
-        )
-        inputs = repeat(
+        template_inputs[:, :, :start_index] = repeat(
             inputs,
             "batch variates seq_len -> (sampling_batch_size batch) variates seq_len",
             sampling_batch_size=sampling_batch_size,
         )
-        input_padding_mask = repeat(
-            input_padding_mask,
-            "batch variates seq_len -> (sampling_batch_size batch) variates seq_len",
-            sampling_batch_size=sampling_batch_size,
-        )
-        id_mask = repeat(
+
+        template_id_mask = torch.empty_like(template_inputs, dtype=id_mask.dtype)
+        template_id_mask[:, :, :start_index] = repeat(
             id_mask,
             "batch variates seq_len -> (sampling_batch_size batch) variates seq_len",
             sampling_batch_size=sampling_batch_size,
         )
-        timestamp_seconds = repeat(
+        template_id_mask[:, :, start_index:] = repeat(
+            id_mask[:, :, -1:],
+            "batch variates 1 -> (sampling_batch_size batch) variates time",
+            sampling_batch_size=sampling_batch_size,
+            time=rounded_steps,
+        )
+
+        template_padding = torch.ones_like(template_id_mask, dtype=torch.bool)
+        template_padding[:, :, :start_index] = repeat(
+            input_padding_mask,
+            "batch variates seq_len -> (sampling_batch_size batch) variates seq_len",
+            sampling_batch_size=sampling_batch_size,
+        )
+
+        ts_repeated = repeat(
             timestamp_seconds,
             "batch variates seq_len -> (sampling_batch_size batch) variates seq_len",
             sampling_batch_size=sampling_batch_size,
         )
-        time_interval_seconds = repeat(
+        intervals_repeated = repeat(
             time_interval_seconds,
             "batch variates -> (sampling_batch_size batch) variates",
             sampling_batch_size=sampling_batch_size,
         )
+        template_timestamps = torch.empty_like(template_inputs, dtype=timestamp_seconds.dtype)
+        template_timestamps[:, :, :start_index] = ts_repeated
+        offsets = torch.arange(1, rounded_steps + 1, device=inputs.device, dtype=timestamp_seconds.dtype)
+        future_ts = ts_repeated[:, :, -1:] + intervals_repeated.unsqueeze(-1) * offsets
+        template_timestamps[:, :, start_index:] = future_ts
 
-        all_samples = []
         if use_kv_cache:
             kv_cache = self.model.allocate_kv_cache(
-                batch_size=inputs.shape[0],
-                num_variates=inputs.shape[1],
-                max_time_steps=inputs.shape[2] + rounded_steps,
+                batch_size=template_inputs.shape[0],
+                num_variates=template_inputs.shape[1],
+                max_time_steps=final_len,
                 device=inputs.device,
                 dtype=inputs.dtype,
             )
         else:
             kv_cache = None
 
-        scaling_prefix_length = inputs.shape[-1]
+        scaling_prefix_length = start_index
 
-        for _ in range(num_batches):
-            batch_inputs = torch.clone(inputs)
-            batch_input_padding_mask = torch.clone(input_padding_mask)
-            batch_id_mask = torch.clone(id_mask)
-            batch_timestamp_seconds = torch.clone(timestamp_seconds)
+        outputs = torch.empty(
+            (inputs.shape[0] * num_samples, inputs.shape[1], final_len),
+            device=inputs.device,
+            dtype=inputs.dtype,
+        )
 
-            for _ in range(rounded_steps // patch_size):
+        for b in range(num_batches):
+            batch_start = b * template_inputs.shape[0]
+            batch_end = batch_start + template_inputs.shape[0]
+            batch_inputs = template_inputs.clone()
+
+            for step in range(rounded_steps // patch_size):
+                cur_end = start_index + step * patch_size
                 base_distr, loc, scale = self.model(
-                    inputs=batch_inputs,
-                    input_padding_mask=batch_input_padding_mask,
-                    id_mask=batch_id_mask,
+                    inputs=batch_inputs[:, :, :cur_end],
+                    input_padding_mask=template_padding[:, :, :cur_end],
+                    id_mask=template_id_mask[:, :, :cur_end],
                     kv_cache=kv_cache,
                     scaling_prefix_length=scaling_prefix_length,
                 )
                 distr = self.create_affine_transformed(base_distr, loc, scale)
-
                 sample = distr.sample()
                 assert sample is not None
-
-                # We remove extreme values that can occur early in training
-                # and cause validation metrics to be NaN
                 samples = replace_extreme_values(sample[:, :, -patch_size:])
-                batch_inputs = torch.cat([batch_inputs, samples], dim=-1)
-                batch_id_mask = torch.cat([batch_id_mask, dummy_id_mask], dim=-1)
-                batch_input_padding_mask = torch.cat([batch_input_padding_mask, dummy_padding], dim=-1)
-                for _ in range(patch_size):
-                    next_timestamp = batch_timestamp_seconds[:, :, -1] + time_interval_seconds
-                    batch_timestamp_seconds = torch.cat([batch_timestamp_seconds, next_timestamp.unsqueeze(-1)], dim=-1)
-            all_samples.append(batch_inputs)
+                batch_inputs[:, :, cur_end : cur_end + patch_size] = samples
+
+            outputs[batch_start:batch_end] = batch_inputs
             if kv_cache is not None:
                 kv_cache.reset()
 
-        outputs = torch.cat(all_samples, dim=0)
         unfolded_outputs = rearrange(
             outputs,
             "(samples batch) variates seq_len -> batch variates seq_len samples",

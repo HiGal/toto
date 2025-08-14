@@ -72,6 +72,7 @@ class TotoSampleForecastGenerator(SampleForecastGenerator):
             else:
                 raise ValueError(f"Cannot handle frequency of type {type(freq)}: {freq}")
 
+    @torch.inference_mode()
     def _generate(
         self,
         inference_data_loader: DataLoader,
@@ -103,38 +104,29 @@ class TotoSampleForecastGenerator(SampleForecastGenerator):
                 num_variates=inputs.shape[1],
             )
 
-            # First, build a single NumPy array from your list comprehension
-            np_timestamps = np.array(
+            start_seconds = torch.tensor(
                 [
-                    (
-                        pd.period_range(
-                            start=forecast_start - forecast_start.freq,
-                            periods=inputs.shape[-1],
-                            freq=forecast_start.freq,
-                        )
-                        .to_timestamp(freq=forecast_start.freq)
-                        .view(np.int64)
-                        // int(1e9)  # Convert to Unix timestamp in seconds
-                    )
-                    .clip(INT_MIN, INT_MAX)
-                    .astype(int)  # Clamp to torch.int range
+                    int((forecast_start - forecast_start.freq).to_timestamp().value // 1_000_000_000)
                     for forecast_start in batch["forecast_start"]
-                ]
+                ],
+                dtype=torch.int,
+                device=inputs.device,
             )
-
-            # Then, create a tensor from the contiguous NumPy array
+            intervals = torch.tensor(
+                [self.freq_to_seconds(forecast_start.freq) for forecast_start in batch["forecast_start"]],
+                dtype=torch.int,
+                device=inputs.device,
+            )
+            offsets = torch.arange(inputs.shape[-1], device=inputs.device, dtype=torch.int)
+            ts = start_seconds.unsqueeze(-1) + intervals.unsqueeze(-1) * offsets
+            ts = ts.clamp(INT_MIN, INT_MAX)
             timestamps = repeat(
-                torch.tensor(np_timestamps, dtype=torch.int, device=inputs.device),
+                ts,
                 "batch time_steps -> batch num_variates time_steps",
                 num_variates=inputs.shape[1],
             )
-
             time_intervals = repeat(
-                torch.tensor(
-                    [self.freq_to_seconds(forecast_start.freq) for forecast_start in batch["forecast_start"]],
-                    dtype=torch.int,
-                    device=inputs.device,
-                ),
+                intervals,
                 "batch -> batch num_variates",
                 num_variates=inputs.shape[1],
             )
@@ -430,7 +422,7 @@ class TotoPredictor(PyTorchPredictor):
         if eval:
             self.prediction_net.eval()
 
-        with torch.no_grad():
+        with torch.inference_mode():
             yield from self.forecast_generator(
                 inference_data_loader=inference_data_loader,
                 prediction_net=self.prediction_net,
